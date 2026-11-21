@@ -22,8 +22,9 @@ from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.dataset import save_param_stats
 from utils.logger import (plot_metrics, plot_step_metrics, record_metrics,
                           record_step, reset_metrics)
+from utils.optim import build_optimizer, build_scheduler
 from utils.train_utils import all_reduce_mean, autocast_context, broadcast_flag, \
-    build_scheduler, optimizer_step, tqdm
+    optimizer_step, tqdm
 
 
 # ================================================================ 导出
@@ -74,12 +75,14 @@ class BaseTrainer(ABC):
         self.world_size = world_size        # 多卡：总卡数（单卡为 1）
         self.is_main = rank == 0
         self.start_epoch = 0
-        self.optimizer = torch.optim.AdamW(
-            self.train_parameters(), lr=self.tcfg["lr"],
-            weight_decay=self.tcfg["weight_decay"])
-        self.scheduler = build_scheduler(
-            self.optimizer, self.scheduler_total_steps(),
-            self.tcfg.get("warmup_ratio", 0.1))
+        # 优化器：AdamW（默认，范数/偏置/嵌入不衰减）或 Muon（tcfg.optimizer="muon"）
+        self.optimizer = build_optimizer(self.train_named_parameters(), self.tcfg)
+        total = self.scheduler_total_steps()
+        # warmup 优先按步数配置（warmup_steps），否则按比例；比例默认 0.03（v1 的 0.1×200epoch
+        # 会导致 20 个 epoch 都在 warmup，早停在学习率退火前就触发）
+        warm = self.tcfg.get("warmup_steps") or int(total * self.tcfg.get("warmup_ratio", 0.03))
+        self.scheduler = build_scheduler(self.optimizer, total, warm,
+                                         self.tcfg.get("min_lr_ratio", 0.01))
         # bf16 混合精度无需 loss scaling（GradScaler 仅 fp16 需要）；
         # 保留 scaler 对象以维持 optimizer_step / 断点保存接口不变（enabled=False 时透传）
         self.scaler = torch.amp.GradScaler(
@@ -98,8 +101,9 @@ class BaseTrainer(ABC):
             logger.info("resumed from %s at epoch %d", resume, self.start_epoch)
 
     # ---------------- 钩子 ----------------
-    def train_parameters(self):
-        return self.model.parameters()
+    def train_named_parameters(self):
+        """参与训练的 (name, param) 列表（子类可过滤）。"""
+        return [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
 
     @abstractmethod
     def train_one_epoch(self):
@@ -227,10 +231,10 @@ class MAEPretrainer(BaseTrainer):
     def _train_loaders(self):
         return [self.loader]
 
-    def train_parameters(self):
+    def train_named_parameters(self):
         # 任务头无梯度，不参与预训练
-        return [p for name, p in self.model.named_parameters()
-                if not name.startswith("task_heads")]
+        return [(name, p) for name, p in self.model.named_parameters()
+                if not name.startswith("task_heads") and p.requires_grad]
 
     def n_epochs(self):
         return self.tcfg["epochs_pretrain"]
@@ -421,3 +425,335 @@ def next_batch(iters, loader, task):
     except StopIteration:
         iters[task] = iter(loader[task])
         return next(iters[task])
+
+
+# ================================================================ v2 训练器
+from training.tasks_v2 import TASKS_V2, TASK_ORDER as TASK_ORDER_V2   # noqa: E402
+from utils.augment import augment_iq                                  # noqa: E402
+from utils.optim import ModelEMA                                      # noqa: E402
+from utils.train_utils import all_reduce_grads                        # noqa: E402
+
+
+class _Cycle:
+    """无限循环迭代器（steps_per_epoch 与 loader 长度解耦）。"""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self.it = iter(loader)
+
+    def next(self):
+        try:
+            return next(self.it)
+        except StopIteration:
+            self.it = iter(self.loader)
+            return next(self.it)
+
+
+def export_model_v2(model, cfg, codec, out_dir):
+    """导出官方推理格式：config.json（内嵌 param_codec）+ model.safetensors + param_codec.json。"""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = json.loads(json.dumps(cfg))
+    cfg["model"]["param_codec"] = codec.spec
+    cfg["model"]["param_head_spec"] = codec.head_spec()
+    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False),
+                                         encoding="utf-8")
+    sd = model.deploy_state_dict()
+    save_file({k: v.detach().contiguous().clone().cpu() for k, v in sd.items()},
+              str(out_dir / "model.safetensors"))
+    codec.save(out_dir / "param_codec.json")
+
+
+class MAEPretrainerV2(MAEPretrainer):
+    """v2 预训练：SimMIM 块掩码 + 防泄漏全局视图 + val 重建损失早停。
+
+    epoch 定义为 steps_per_epoch_pretrain 个优化步（0 = 遍历一次 loader），
+    每个 epoch 末在 val 子集上用固定随机种子的掩码计算重建损失，
+    连续 patience_pretrain 次没有改善 min_delta(相对) 即早停。
+    """
+
+    def __init__(self, cfg, model, device, logger, out_dir, loader, val_loader=None,
+                 resume=None, smoke_steps=0, rank=0, world_size=1):
+        self.val_loader = val_loader
+        self._spe = cfg["training"].get("steps_per_epoch_pretrain", 0) or len(loader)
+        super().__init__(cfg, model, device, logger, out_dir, loader, resume, smoke_steps,
+                         rank, world_size)
+        self.cycle = _Cycle(loader)
+
+    def train_named_parameters(self):
+        return [(n, p) for n, p in self.model.named_parameters()
+                if not n.startswith("task_heads") and p.requires_grad]
+
+    def scheduler_total_steps(self):
+        spe = min(self._spe, self.smoke_steps) if self.smoke_steps else self._spe
+        return max(1, spe * self.tcfg["epochs_pretrain"])
+
+    def train_one_epoch(self):
+        self.model.train()
+        n = min(self._spe, self.smoke_steps) if self.smoke_steps else self._spe
+        tot, cnt, norms = 0.0, 0, []
+        acc = {"loss_time": 0.0, "loss_stft": 0.0}
+        log_every = self.tcfg.get("log_every", 50)
+        for step in tqdm(range(n), desc=f"pretrain-v2 epoch {self._epoch + 1}/{self.n_epochs()}",
+                         leave=False, dynamic_ncols=True, disable=not self.is_main):
+            iq, _ = self.cycle.next()
+            iq = augment_iq(iq.to(self.device, non_blocking=True), "pretrain",
+                            self.tcfg.get("augment_policy"))
+            with autocast_context(self.device, self.tcfg.get("amp", True)):
+                loss, parts = self.model.forward_pretrain(iq)
+            gn = optimizer_step(loss, self.optimizer, self.model, self.scaler,
+                                self.tcfg.get("grad_clip", 1.0), world_size=self.world_size)
+            self.scheduler.step()
+            self.global_step += 1
+            if step % log_every == 0 or step == n - 1:
+                lv = float(loss)
+                tot += lv
+                cnt += 1
+                norms.append(gn)
+                for k in acc:
+                    acc[k] += float(parts[k])
+                self._log_scalars({"train/loss": lv, "train/grad_norm": gn,
+                                   "train/lr": self.scheduler.get_last_lr()[0]})
+        self._epoch_loss = tot / max(1, cnt)
+        out = {"recon_loss": self._epoch_loss,
+               "grad_norm": sum(norms) / max(1, len(norms))}
+        out.update({k: v / max(1, cnt) for k, v in acc.items()})
+        return out
+
+    @torch.no_grad()
+    def _val_loss(self):
+        if self.val_loader is None:
+            return None
+        self.model.eval()
+        n_max = self.tcfg.get("val_batches_pretrain", 50)
+        tot, cnt = 0.0, 0
+        with torch.random.fork_rng(devices=[self.device] if self.device.type == "cuda" else []):
+            torch.manual_seed(1234)
+            for i, (iq, _) in enumerate(self.val_loader):
+                if i >= n_max:
+                    break
+                with autocast_context(self.device, self.tcfg.get("amp", True)):
+                    loss, _ = self.model.forward_pretrain(iq.to(self.device))
+                tot += float(loss)
+                cnt += 1
+        return tot / max(1, cnt)
+
+    def on_epoch_end(self, epoch):
+        if self.smoke_steps:
+            return {}
+        v = self._val_loss()
+        metric = v if v is not None else self._epoch_loss
+        rel = self.tcfg.get("min_delta_pretrain", 1e-3)
+        if metric < self.best_loss * (1 - rel):
+            self.best_loss, self.bad = metric, 0
+            if self.is_main:
+                export_pretrained(self.model, self.out_dir)   # 随时保留最佳预训练权重
+                self.logger.info("pretrain best %s=%.5f", "val_recon" if v is not None
+                                 else "train_recon", metric)
+        else:
+            self.bad += 1
+        return {"val_recon_loss": v} if v is not None else {}
+
+    def should_stop(self):
+        return self.bad >= self.tcfg.get("patience_pretrain", 5)
+
+    def on_finish(self):
+        if self.smoke_steps or not (self.out_dir / "mae_pretrained.pt").exists():
+            export_pretrained(self.model, self.out_dir)
+        self.logger.info("best pretrained weights -> %s", self.out_dir / "mae_pretrained.pt")
+
+
+class MultitaskFinetunerV2(BaseTrainer):
+    """v2 多任务微调：一次迭代 = 三任务各一个 batch 的梯度累加 -> 一次优化步。
+
+    相比 v1 "每个任务各自 optimizer.step()"：
+      * 共享参数每步看到的是三任务的联合梯度（真正的多任务优化，而非交替拉扯）；
+      * 可选 PCGrad（Yu et al., NeurIPS 2020）消解任务间冲突梯度；
+      * 可选不确定性加权（Kendall et al., CVPR 2018）或固定权重；
+      * EMA 权重评估/导出；评估指标带 min_delta 的早停（按评估次数计）。
+    """
+
+    tag = "finetune"
+    resume_name = "finetune_resume.pt"
+
+    def __init__(self, cfg, model, device, logger, out_dir, loaders, codec,
+                 resume=None, smoke_steps=0, rank=0, world_size=1):
+        self.loaders = loaders
+        self.codec = codec
+        tc = cfg["training"]
+        self.weights = tc.get("task_weights", {"protocol": 0.5, "modulation": 1.0,
+                                               "parameter": 1.0})
+        self.weighting = tc.get("task_weighting", "fixed")
+        self.log_vars = None
+        if self.weighting == "uncertainty":
+            self.log_vars = torch.nn.Parameter(torch.zeros(len(TASK_ORDER_V2), device=device))
+        self._spe = tc.get("steps_per_epoch", 0) or max(len(loaders["train"][t])
+                                                        for t in TASK_ORDER_V2)
+        self.best, self.bad = -float("inf"), 0
+        self.ema = None
+        super().__init__(cfg, model, device, logger, out_dir, resume, smoke_steps,
+                         rank, world_size)
+        if tc.get("ema_decay", 0) > 0:
+            self.ema = ModelEMA(model, tc["ema_decay"])
+            if resume:
+                st = torch.load(resume, map_location="cpu", weights_only=False)
+                if "ema" in st:
+                    self.ema.load_state_dict(st["ema"])
+        self.cycles = {t: _Cycle(loaders["train"][t]) for t in TASK_ORDER_V2}
+        self.pcgrad = bool(tc.get("pcgrad", False))
+        self.shared_params = [p for p in list(model.tokenizer.parameters())
+                              + list(model.backbone.parameters())
+                              if p.requires_grad and all(p is not q for q in
+                                                         model.tokenizer.private_parameters())]
+
+    # ---------------- 钩子 ----------------
+    def train_named_parameters(self):
+        named = [(n, p) for n, p in self.model.named_parameters()
+                 if p.requires_grad and not n.startswith("pretrain_head")]
+        if self.log_vars is not None:
+            named.append(("log_vars.bias", self.log_vars))      # ".bias" -> 不做权重衰减
+        return named
+
+    def n_epochs(self):
+        return self.tcfg["epochs_finetune"]
+
+    def _train_loaders(self):
+        return list(self.loaders["train"].values())
+
+    def scheduler_total_steps(self):
+        spe = min(self._spe, self.smoke_steps) if self.smoke_steps else self._spe
+        return max(1, spe * self.tcfg["epochs_finetune"])
+
+    def _weighted(self, i, task, loss):
+        if self.log_vars is not None:
+            s = self.log_vars[i]
+            return 0.5 * torch.exp(-s) * loss + 0.5 * s
+        return float(self.weights.get(task, 1.0)) * loss
+
+    def _flat_shared_grad(self):
+        return torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1)
+                          for p in self.shared_params])
+
+    def _apply_pcgrad(self, grads):
+        out = []
+        for i, g in enumerate(grads):
+            g = g.clone()
+            for j in torch.randperm(len(grads)).tolist():
+                if j == i:
+                    continue
+                dot = torch.dot(g, grads[j])
+                if dot < 0:
+                    g -= dot / (grads[j].pow(2).sum() + 1e-12) * grads[j]
+            out.append(g)
+        total = torch.stack(out).sum(0)
+        off = 0
+        for p in self.shared_params:
+            n = p.numel()
+            p.grad = total[off:off + n].view_as(p).to(p.dtype)
+            off += n
+
+    def train_one_epoch(self):
+        self.model.train()
+        n = min(self._spe, self.smoke_steps) if self.smoke_steps else self._spe
+        sums = {t: 0.0 for t in TASK_ORDER_V2}
+        cnt, norms = 0, []
+        log_every = self.tcfg.get("log_every", 50)
+        for step in tqdm(range(n), desc=f"finetune-v2 epoch {self._epoch + 1}/{self.n_epochs()}",
+                         leave=False, dynamic_ncols=True, disable=not self.is_main):
+            self.optimizer.zero_grad(set_to_none=True)
+            grads, losses = [], {}
+            for i, task in enumerate(TASK_ORDER_V2):
+                batch = self.cycles[task].next()
+                batch = {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v)
+                         for k, v in batch.items()}
+                with autocast_context(self.device, self.tcfg.get("amp", True)):
+                    loss, _ = TASKS_V2[task].loss(self.model, batch, self.tcfg)
+                    wl = self._weighted(i, task, loss)
+                wl.backward()
+                losses[task] = loss.detach()
+                if self.pcgrad:
+                    grads.append(self._flat_shared_grad())
+                    for p in self.shared_params:
+                        p.grad = None
+            if self.pcgrad:
+                self._apply_pcgrad(grads)
+            all_reduce_grads(self.model, self.world_size)
+            gn = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                      self.tcfg.get("grad_clip", 1.0)))
+            self.optimizer.step()
+            self.scheduler.step()
+            if self.ema is not None:
+                self.ema.update(self.model)
+            self.global_step += 1
+            if step % log_every == 0 or step == n - 1:
+                cnt += 1
+                norms.append(gn)
+                vals = {f"train/loss_{t}": float(v) for t, v in losses.items()}
+                for t, v in losses.items():
+                    sums[t] += float(v)
+                vals.update({"train/grad_norm": gn, "train/lr": self.scheduler.get_last_lr()[0]})
+                if self.log_vars is not None:
+                    vals.update({f"train/logvar_{t}": float(self.log_vars[i])
+                                 for i, t in enumerate(TASK_ORDER_V2)})
+                self._log_scalars(vals)
+        out = {f"train_{t}_loss": sums[t] / max(1, cnt) for t in TASK_ORDER_V2}
+        out["grad_norm"] = sum(norms) / max(1, len(norms))
+        return out
+
+    def eval_model(self):
+        m = self.ema.ema if self.ema is not None else self.model
+        m.codec = self.codec
+        return m
+
+    def on_epoch_end(self, epoch):
+        if self.smoke_steps or (epoch + 1) % self.tcfg.get("eval_every", 1) != 0:
+            return {}
+        model = self.eval_model()
+        results = {}
+        with autocast_context(self.device, self.tcfg.get("amp", True)):
+            for t in TASK_ORDER_V2:
+                loader = self.loaders["val"][t]
+                m = TASKS_V2[t].evaluate(model, loader, self.device, self.tcfg)
+                results[t] = all_reduce_mean(m, len(loader.dataset) // max(1, self.world_size),
+                                             self.device, self.world_size)
+        values = {f"val_{t}_{k}": v for t, m in results.items() for k, v in m.items()}
+        w = self.tcfg.get("score_weights", {"protocol": 0.3, "modulation": 0.3,
+                                            "parameter": 0.4})
+        score = (w["protocol"] * results["protocol"]["acc"]
+                 + w["modulation"] * results["modulation"]["acc"]
+                 + w["parameter"] * results["parameter"]["precision"])
+        values["val_proxy_score"] = score
+        if score > self.best + self.tcfg.get("min_delta", 1e-4):
+            self.best, self.bad = score, 0
+            if self.is_main:
+                export_model_v2(model, self.cfg, self.codec, self.out_dir)
+                self.logger.info("new best proxy score=%.5f (exported %s weights)", score,
+                                 "EMA" if self.ema is not None else "raw")
+        else:
+            self.bad += 1
+        self.model.train()
+        return values
+
+    def checkpoint_extra(self):
+        extra = {"best": self.best, "bad": self.bad}
+        if self.ema is not None:
+            extra["ema"] = self.ema.state_dict()
+        if self.log_vars is not None:
+            extra["log_vars"] = self.log_vars.detach().cpu()
+        return extra
+
+    def on_resume(self, extra):
+        self.best = extra.get("best", -float("inf"))
+        self.bad = extra.get("bad", 0)
+        if self.log_vars is not None and "log_vars" in extra:
+            with torch.no_grad():
+                self.log_vars.copy_(extra["log_vars"].to(self.log_vars.device))
+
+    def should_stop(self):
+        return self.bad >= self.tcfg.get("patience", 6)
+
+    def on_finish(self):
+        if self.smoke_steps or not (self.out_dir / "model.safetensors").exists():
+            export_model_v2(self.eval_model(), self.cfg, self.codec, self.out_dir)
+        self.logger.info("finished; official inference weights: %s",
+                         self.out_dir / "model.safetensors")

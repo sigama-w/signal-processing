@@ -22,7 +22,7 @@ _MODEL_KEYS = {
     "backbone", "d_model", "n_layers", "nhead", "ffn_hidden", "patch_size",
     "sr_bins", "pos_encoding", "mask_ratio", "mae_decoder_layers", "head_hidden",
     "use_frequency", "layer_types", "hybrid_layers",
-    "mla_kv_lora_rank", "mla_q_lora_rank",
+    "mla_kv_lora_rank", "mla_q_lora_rank", "arch",
 }
 
 
@@ -61,23 +61,40 @@ def load_config(path):
 
 
 def load_mae_pretrained(model, path, logger=None):
-    """将 MAE 预训练的共享权重加载进模型（仅加载 checkpoint 中存在且模型有的模块）。
+    """将 MAE 预训练的共享权重加载进模型。
 
-    任务头与 MAE decoder 不在预训练导出范围内，保持随机初始化。
+    【v1 遗留 bug 修复】export_pretrained 保存的是"扁平" state_dict
+    （键形如 tokenizer.cls_token / backbone.layers.0...），而旧实现按
+    state["tokenizer"] 这种"模块名"键查找——永远找不到，日志里显示
+    loaded [...] 为空列表，即**预训练权重从未真正进入微调**。
+    现按前缀筛选扁平键 + strict=False 加载，并打印实际加载/缺失的数量。
 
+    任务头与重建头不加载（保持随机初始化 / 丢弃）。
     Returns:
-        bool: 是否成功加载。
+        bool: 是否成功加载了至少一个张量。
     """
     if not Path(path).exists():
         if logger:
             logger.info("no MAE checkpoint at %s, training from scratch", path)
         return False
     state = torch.load(path, map_location="cpu", weights_only=False)
-    loaded = []
-    for key in ("tokenizer", "backbone", "frequency_tokenizer", "cross_domain_fusion"):
-        if key in state and hasattr(model, key):
-            getattr(model, key).load_state_dict(state[key])
-            loaded.append(key)
+    prefixes = ("tokenizer.", "backbone.", "frequency_tokenizer.", "cross_domain_fusion.",
+                "mask_token")
+    # 兼容两种格式：扁平键（当前导出格式）与 {模块名: 子 state_dict}（更早的格式）
+    flat = {}
+    for k, v in state.items():
+        if isinstance(v, dict):
+            flat.update({f"{k}.{kk}": vv for kk, vv in v.items()})
+        else:
+            flat[k] = v
+    own = model.state_dict()
+    picked = {k: v for k, v in flat.items()
+              if k.startswith(prefixes) and k in own and own[k].shape == v.shape}
+    skipped = [k for k in flat if k.startswith(prefixes) and k not in picked]
+    model.load_state_dict(picked, strict=False)
     if logger:
-        logger.info("loaded MAE pretrained weights from %s [%s]", path, ", ".join(loaded))
-    return True
+        logger.info("loaded MAE pretrained weights from %s: %d tensors (%d shape/key mismatch skipped)",
+                    path, len(picked), len(skipped))
+        if skipped:
+            logger.info("  skipped examples: %s", skipped[:5])
+    return len(picked) > 0

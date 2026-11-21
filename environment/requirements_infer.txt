@@ -1,0 +1,5 @@
+# 推理镜像最小依赖（torch 由基础镜像 pytorch/pytorch:2.3.1-cuda12.1 提供）
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==17.0.0
+safetensors==0.4.3

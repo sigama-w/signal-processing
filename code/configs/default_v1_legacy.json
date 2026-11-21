@@ -1,0 +1,59 @@
+{
+  "model": {
+    "backbone": "hybrid",
+    "d_model": 512,
+    "n_layers": 27,
+    "nhead": 8,
+    "ffn_hidden": 2048,
+    "patch_size": 8,
+    "sr_bins": 64,
+    "pos_encoding": "rope",
+    "mask_ratio": 0.75,
+    "mae_decoder_layers": 2,
+    "head_hidden": 256,
+    "head_layers": 1,
+    "head_config": {
+      "protocol": { "hidden": 256, "layers": 1 },
+      "modulation": { "hidden": 256, "layers": 1 },
+      "parameter": { "hidden": 512, "layers": 2 },
+      "parameter_pattern": { "hidden": 512, "layers": 2 }
+    },
+    "use_frequency": true,
+    "layer_types": [
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla",
+      "full_attention", "mla", "mla"
+    ],
+    "mla_kv_lora_rank": 128,
+    "mla_q_lora_rank": 128
+  },
+  "training": {
+    "seq_len": 1024,
+    "batch_size": 512,
+    "lr": 0.0001,
+    "weight_decay": 0.05,
+    "epochs_pretrain": 200,
+    "epochs_finetune": 200,
+    "warmup_ratio": 0.1,
+    "num_workers": 4,
+    "ref_scale": 0.5,
+    "grad_clip": 1.0,
+    "seed": 42,
+    "amp": true,
+    "patience": 10,
+    "patience_pretrain": 10,
+    "eval_every": 1,
+    "log_every": 20,
+    "task_weights": {
+      "protocol": 0.3,
+      "modulation": 0.3,
+      "parameter": 0.4
+    }
+  }
+}

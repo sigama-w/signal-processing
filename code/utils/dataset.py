@@ -155,6 +155,7 @@ class EMSignalDataset(Dataset):
         if self.task == "parameter" and self.has_params:
             params = np.array([row[c] for c in self._param_cols], dtype=np.float32)
             valid = np.array([bool(row[c]) for c in self._valid_cols], dtype=np.float32)
+            item["raw_params"] = torch.from_numpy((params * valid).astype(np.float32))
             # pattern: 通信(前3参数有效)=0 / 雷达(后4参数有效)=1
             pattern = float(valid[3])  # pulse_width_valid
             if self.param_stats is not None:
@@ -195,6 +196,25 @@ class PreparedOfficialDataset(Dataset):
     def __len__(self):
         return self.n
 
+    def lengths(self, chunk=8192):
+        """每个样本的原始长度（512/1024，按后半段是否全零判断），首次计算后缓存 lengths.npy。"""
+        d = os.path.dirname(self.iq.filename)
+        cache = os.path.join(d, "lengths.npy")
+        if os.path.exists(cache):
+            arr = np.load(cache)
+            if len(arr) == self.n:
+                return arr
+        half = self.seq_len // 2
+        out = np.empty(self.n, dtype=np.int32)
+        for s in range(0, self.n, chunk):
+            blk = np.asarray(self.iq[s:s + chunk, half:, :])
+            out[s:s + chunk] = np.where(np.any(blk != 0, axis=(1, 2)), self.seq_len, half)
+        try:
+            np.save(cache, out)
+        except OSError:
+            pass
+        return out
+
     def __getitem__(self, i):
         iq = np.array(self.iq[i])  # memmap 切片拷贝
         item = {
@@ -210,6 +230,8 @@ class PreparedOfficialDataset(Dataset):
             params = np.array(self.meta["params"][i], dtype=np.float32)
             valid = np.array(self.meta["valid"][i], dtype=np.float32)
             pattern = int(self.meta["patterns"][i])
+            # v2：原始 SI 参数（无效位置 0），由 ParamCodec 在 GPU 上编码
+            item["raw_params"] = torch.from_numpy((params * valid).astype(np.float32))
             if self.param_stats is not None:
                 mn, mx = self.param_stats["min"], self.param_stats["max"]
                 params = np.clip((params - mn) / (mx - mn + 1e-12), 0.0, 1.0)
@@ -272,6 +294,8 @@ def collate_fn(batch):
         out["params"] = torch.stack([b["params"] for b in batch])
         out["valid"] = torch.stack([b["valid"] for b in batch])
         out["pattern"] = torch.stack([b["pattern"] for b in batch])
+    if "raw_params" in batch[0]:
+        out["raw_params"] = torch.stack([b["raw_params"] for b in batch])
     return out
 
 
@@ -356,3 +380,121 @@ def load_param_stats(path):
         d = json.load(f)
     return {"min": np.array(d["min"], dtype=np.float32),
             "max": np.array(d["max"], dtype=np.float32)}
+
+
+# ============================================================ v2 数据加载增强
+def dataset_lengths(ds):
+    """返回数据集（含 Subset）每个样本的原始长度数组；无法获得时返回 None。"""
+    if isinstance(ds, torch.utils.data.Subset):
+        base = dataset_lengths(ds.dataset)
+        return None if base is None else base[np.asarray(ds.indices)]
+    if isinstance(ds, PreparedOfficialDataset):
+        return ds.lengths()
+    if isinstance(ds, EMSignalDataset):
+        return np.array([len(to_iq_array(v)) for v in ds.df["iq"]], dtype=np.int32)
+    return None
+
+
+class LengthGroupedBatchSampler(torch.utils.data.Sampler):
+    """按长度分桶组 batch（512 点与 1024 点样本不混批）。
+
+    配合模型的 trim_padding：512 点 batch 时域 token 从 128 裁到 64，
+    主干计算量约减半（40% 样本受益），训练整体提速 ~20-30%，且无补零噪声。
+    每个 epoch：桶内打乱 -> 切 batch -> batch 顺序全局打乱。
+    """
+
+    def __init__(self, lengths, batch_size, shuffle=True, drop_last=True, seed=42):
+        self.lengths = np.asarray(lengths)
+        self.bs = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+        self.groups = [np.where(self.lengths == v)[0] for v in np.unique(self.lengths)]
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _batches(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches = []
+        for g in self.groups:
+            idx = rng.permutation(g) if self.shuffle else g
+            for s in range(0, len(idx), self.bs):
+                b = idx[s:s + self.bs]
+                if len(b) < self.bs and self.drop_last:
+                    continue
+                batches.append(b.tolist())
+        if self.shuffle:
+            order = rng.permutation(len(batches))
+            batches = [batches[i] for i in order]
+        return batches
+
+    def __iter__(self):
+        batches = self._batches()
+        self.epoch += 1          # 自动推进：每次重新迭代得到不同打乱顺序
+        return iter(batches)
+
+    def __len__(self):
+        n = 0
+        for g in self.groups:
+            n += len(g) // self.bs if self.drop_last else -(-len(g) // self.bs)
+        return n
+
+
+def make_loader(ds, batch_size, train, num_workers=0, bucket=False, collate=collate_fn,
+                seed=42, rank=0, world_size=1):
+    """统一 DataLoader 构造：train 时 drop_last；单卡可按长度分桶；多卡用 DistributedSampler。"""
+    common = dict(collate_fn=collate, num_workers=num_workers,
+                  pin_memory=torch.cuda.is_available(),
+                  persistent_workers=num_workers > 0)
+    if num_workers > 0:
+        common["prefetch_factor"] = 4
+    if world_size > 1:
+        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=train)
+        return DataLoader(ds, batch_size=batch_size, sampler=sampler, drop_last=train, **common)
+    if bucket:
+        lengths = dataset_lengths(ds)
+        if lengths is not None:
+            bs = LengthGroupedBatchSampler(lengths, batch_size, shuffle=train,
+                                           drop_last=train, seed=seed)
+            return DataLoader(ds, batch_sampler=bs, **common)
+    return DataLoader(ds, batch_size=batch_size, shuffle=train, drop_last=train, **common)
+
+
+def build_task_dataloaders_v2(data_dir, batch_size=256, seq_len=1024, splits=("train", "val"),
+                              tasks=("protocol", "modulation", "parameter"), num_workers=4,
+                              bucket=True, eval_batch_size=None, rank=0, world_size=1, seed=42):
+    """v2 多任务 loader：train 分桶 + drop_last；val/test 也分桶（推理更快且结果与不分桶一致）。"""
+    loaders = {}
+    for split in splits:
+        loaders[split] = {}
+        for task in tasks:
+            try:
+                ds = make_task_dataset(data_dir, task, split=split, seq_len=seq_len)
+            except FileNotFoundError:
+                continue
+            bs = batch_size if split == "train" else (eval_batch_size or batch_size)
+            loaders[split][task] = make_loader(ds, bs, split == "train", num_workers,
+                                               bucket=bucket, seed=seed, rank=rank,
+                                               world_size=world_size)
+    return loaders
+
+
+def load_param_arrays(data_dir, split="train"):
+    """读取 parameter 任务原始 SI 参数与有效位（拟合 ParamCodec 用，只用 train 划分）。"""
+    meta_path = os.path.join(data_dir, "parameter", "meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        excl = set(meta.get("val_sample_ids", [])) | set(meta.get("test_sample_ids", []))
+        keep = [i for i, s in enumerate(meta["sample_ids"]) if s not in excl] \
+            if split == "train" else list(range(len(meta["sample_ids"])))
+        p = np.asarray(meta["params"], dtype=np.float64)[keep]
+        v = np.asarray(meta["valid"], dtype=bool)[keep]
+        return p, v
+    pq_path = os.path.join(data_dir, f"{split}_parameter.parquet")
+    ds = EMSignalDataset(pq_path, "parameter")
+    p = np.stack([[ds.df.iloc[i][c] for c in ds._param_cols] for i in range(len(ds))])
+    v = np.stack([[bool(ds.df.iloc[i][c]) for c in ds._valid_cols] for i in range(len(ds))])
+    return p.astype(np.float64), v

@@ -1,0 +1,13 @@
+# 依赖锁定清单（提交前请在训练机上用 `pip freeze > environment/requirements_lock.txt` 覆盖为实际版本）
+# 安装: pip install -r environment/requirements.txt
+torch==2.3.1
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==17.0.0
+safetensors==0.4.3
+tqdm==4.66.4
+tensorboard==2.16.2
+matplotlib==3.8.4
+pytest==8.0.0
+# 可选：triton（随 torch CUDA 版自带）、onnx（utils/export_onnx.py）
+# 昇腾: torch_npu 与 CANN 版本需与 torch 严格配套（如 torch 2.1.0 + torch_npu 2.1.0.post3 + CANN 8.0）

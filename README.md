@@ -1,34 +1,50 @@
-# C01 多类型电磁信号感知 — 时频双流共享基座
+# C01 多类型电磁信号感知 — 物理先验多视角电磁基座模型（v2）
 
-本仓库在原 `signal-processing-main` 上升级。包含两个训练阶段、三任务共享 Transformer、时域/FFT 双流跨注意力融合、统一 Parquet→JSONL 推理、日志与绘图、单元测试。**仅为工程增强的可运行原型，不代表已达到官方数据分数或工业级交付认证。**
+单一共享基座同时完成 **信号体制识别（8 类）/ 调制识别（23 类）/ 7 个物理参数估计**。
+v2 在 v1 基础上重构了输入表征、主干、多任务优化与推理链路，并修复了若干关键缺陷（见下）。
 
-## 最快入口
+> ⚠️ 交付环境无 PyTorch：v2 代码已通过语法检查与 DSP 公式 numpy 校验，但**尚未在 GPU 上运行**。
+> 请先执行 `python -m pytest tests -q` 与两阶段 `--smoke_steps 2` 冒烟，再正式训练。
+
+## v2 要点
+
+| 模块 | v2 方案 |
+|---|---|
+| 输入（任务 1） | 物理前端：有效长度掩码、单位功率归一化、**载频偏移估计与校正**、带外抑制、STFT、x²/x⁴ 非线性谱、包络自相关、星座密度、16 维统计量（实数矩阵 DFT，NPU/ONNX 友好） |
+| 融合（任务 1） | 通道级（时域⊕对齐 STFT 门控）+ 空间级（频点对齐堆叠、模态/位置编码）+ 注意力级（单流联合序列） |
+| 主干 | Conformer 式 `conv / conformer / attn` 混合层，SDPA/FlashAttention，默认 ~35M 参数 |
+| 多任务（任务 2） | 任务提示 + 任务专属注意力池化；三任务梯度累加单步更新；可选 PCGrad / 不确定性加权；EMA |
+| 参数估计 | `ParamCodec` 自动为 7 个参数选择 分类/对数标准化/标准化 编码，参数等权损失 |
+| 预训练 | SimMIM 块掩码 + 时域/STFT 双目标 + 防泄漏全局视图 + val 早停 |
+| 效率（任务 3） | 长度分桶 + 补零 token 裁剪、bf16、融合算子自检回退（CUDA Triton / 昇腾 torch_npu）、torch.compile、ONNX 导出、时延/显存/profiling 工具 |
+
+**修复的关键缺陷**：预训练权重从未加载进微调；MAE 通过整段 FFT 泄漏被掩码信息；512 点样本补零无掩码；warmup 占 20 个 epoch；三任务各自 step。
+
+## 快速开始
 
 ```bash
 pip install -r environment/requirements.txt
-python -m pytest tests/test_model_pipeline.py tests/test_infer_outputs.py -q
-python utils/prepare_official.py            # 官方数据 -> memmap（首次必跑，见训练指导 4.0）
+python -m pytest tests -q
+python utils/prepare_official.py                       # 官方数据 -> memmap（只需一次）
+python utils/measure_vram.py --config code/configs/default.json --find_max_bs
 python code/training/pretrain_mae.py --data_dir datasets --out_dir weights
-python code/training/finetune_multitask.py --data_dir datasets --out_dir weights
-python code/infer.py \
-    --input datasets/01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet \
-    --output out/test_predictions.jsonl
+python code/training/finetune_multitask.py --data_dir datasets --out_dir weights --eval_test
+python code/utils/bad_case_analysis.py --task modulation --split val
+python code/infer.py --input datasets/01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet \
+                     --output out/test_predictions.jsonl
+python utils/benchmark_latency.py --weights_dir weights
 ```
 
-`datasets/01|02|03/` 为官方真实数据分块（共 1,179,000 行），`prepare_official.py`
-将其流式转为 `datasets/{task}/iq.memap + meta.json`（含 2% 分层 val 划分）。
-旧模拟数据已移至 `datasets/simulated/`（仅在无 memmap 时回退使用）。
-
-`code/configs/default.json` 控制结构和训练；训练参数设定为建议起点，不是调参最优值。仅调试时可给两阶段脚本加 `--smoke_steps 1`。训练恢复使用 `--resume weights/mae_resume.pt` 或 `--resume weights/finetune_resume.pt`。
-
-`weights/model.safetensors`、`weights/config.json`、`weights/param_stats.json` 在微调结束/最佳模型选择后产生，ZIP 内**不包含已经训练完成的比赛模型**。
+v1 配置仍可用：`--config code/configs/default_v1_legacy.json`。
 
 ## 文档
 
-- [审查、改动与验证状态](docs/CHANGELOG_AND_REVIEW.md)
-- [训练指导](docs/training_guide.md)
-- [官方任务书与分析](docs/C01_task_analysis.md)
+- [优化方案（10 个问题的分析与决策）](docs/OPTIMIZATION_PLAN.md)
+- [v2 新增与修改内容说明](docs/CHANGELOG_V2.md)
+- [代码解读报告](docs/CODE_WALKTHROUGH.md)
+- [本地资源与自测报告模板](docs/self_test_report.md)
+- 历史文档：[v1 审查](docs/CHANGELOG_AND_REVIEW.md)、[训练指导](docs/training_guide.md)、[数据分析](docs/data_analysis_report.md)、[显存分析(v1)](docs/gpu_memory_analysis.md)
 
-## 关键限制
+## 赛题约束
 
-模型需要共享权重 >80%、总参数 <1B；不允许三个独立基座或集成。复赛包含国产硬件适配及推理延迟。此代码优先实现纯 PyTorch 路径，NPU FFT/attention 的实际部署行为尚未验证。
+总参数 < 1B（v2 默认约 35M）；共享权重 > 80%（v2 约 90%，入口自动校验）；单一基座、无集成、无外挂知识库。

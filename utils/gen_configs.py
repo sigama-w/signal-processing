@@ -1,4 +1,8 @@
-"""调参配置生成器：按网格/指定参数批量生成合法 config
+"""【v2 注意】本脚本面向 v1 hybrid 大模型（600M~1B），其显存公式未计入反向峰值，
+对 1024/1536 宽配置低估 10~15GB（见 docs/OPTIMIZATION_PLAN.md §6）。v2 请改用
+code/configs/grid_v2.json + utils/measure_vram.py 实测。
+
+调参配置生成器：按网格/指定参数批量生成合法 config
 
 用法:
     # 默认网格: d_model 1024/1536 × 层数 18~39(每3层一档) × batch 128/256/512 × lr auto,

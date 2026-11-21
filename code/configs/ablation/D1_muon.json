@@ -1,0 +1,121 @@
+{
+  "model": {
+    "arch": "v2",
+    "d_model": 384,
+    "n_layers": 10,
+    "nhead": 6,
+    "ffn_hidden": 1024,
+    "layer_types": [
+      "conv",
+      "conformer",
+      "conformer",
+      "conformer",
+      "conformer",
+      "conformer",
+      "conformer",
+      "conformer",
+      "conformer",
+      "attn"
+    ],
+    "conv_kernel": 15,
+    "dropout": 0.1,
+    "drop_path": 0.1,
+    "seq_len": 1024,
+    "patch_size": 8,
+    "stft_win": 32,
+    "stem_width": 64,
+    "use_stft": true,
+    "use_spec": true,
+    "use_acf": true,
+    "use_const": true,
+    "use_stats": true,
+    "task_prompt": true,
+    "trim_padding": true,
+    "dft_impl": "matmul",
+    "pool_heads": 4,
+    "head_config": {
+      "protocol": {
+        "hidden": 512,
+        "layers": 1
+      },
+      "modulation": {
+        "hidden": 768,
+        "layers": 2
+      },
+      "parameter": {
+        "hidden": 768,
+        "layers": 2
+      }
+    },
+    "mod_family_aux": true,
+    "supcon_dim": 128,
+    "mask_ratio": 0.5,
+    "mask_block": 4,
+    "stft_loss_weight": 0.5
+  },
+  "training": {
+    "seq_len": 1024,
+    "batch_size": 256,
+    "batch_size_pretrain": 512,
+    "eval_batch_size": 1024,
+    "lr": 0.0003,
+    "lr_pretrain": 0.0006,
+    "lr_finetune": 0.0003,
+    "weight_decay": 0.05,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "optimizer": "muon",
+    "warmup_steps": 2000,
+    "min_lr_ratio": 0.01,
+    "epochs_pretrain": 30,
+    "steps_per_epoch_pretrain": 2000,
+    "val_batches_pretrain": 40,
+    "patience_pretrain": 5,
+    "min_delta_pretrain": 0.001,
+    "epochs_finetune": 50,
+    "steps_per_epoch": 1500,
+    "patience": 6,
+    "min_delta": 0.0001,
+    "eval_every": 1,
+    "ema_decay": 0.999,
+    "num_workers": 8,
+    "length_bucketing": true,
+    "grad_clip": 1.0,
+    "seed": 42,
+    "amp": true,
+    "log_every": 50,
+    "augment": true,
+    "task_weighting": "fixed",
+    "task_weights": {
+      "protocol": 0.5,
+      "modulation": 1.0,
+      "parameter": 1.0
+    },
+    "pcgrad": false,
+    "label_smoothing": {
+      "protocol": 0.05,
+      "modulation": 0.1
+    },
+    "family_loss_weight": 0.2,
+    "supcon_weight": {
+      "modulation": 0.0
+    },
+    "supcon_temperature": 0.1,
+    "param_loss": "huber",
+    "pattern_loss_weight": 0.3,
+    "ref_scale": 0.5,
+    "ref_scale_v2": 0.1,
+    "score_weights": {
+      "protocol": 0.3,
+      "modulation": 0.3,
+      "parameter": 0.4
+    },
+    "codec": {
+      "max_classes": 32,
+      "decode": "expectation"
+    }
+  },
+  "_note": "Muon 优化器"
+}
